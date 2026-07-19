@@ -1,0 +1,604 @@
+---
+layout: post
+title:  "Writing an efficient CuTe MMA kernel on T4 GPU"
+date:   2026-07-19
+---
+
+
+# Introduction
+As a learner, I always tend to fall into various technical rabbit holes where I spend days, weeks or even months to fully figure out (to a satisfactory level) what's going on. And always, I learn some of the most unexpected things that I didn't even thought about learning. This time, the name of the rabbit hole was CuTe, and I had to learn a lot of things along the way to get answer to a simple question: what the hell is this CuTe thing actually doing?
+
+As far as I know, CuTe is designed for writing High performance GPU MMA(Matrix-Multiply-Accumulate) kernel in a more intuitive and efficient way.
+
+It presents some special way of dealing with matrices and tensors. Basically it is something like this: a tensor consists of an engine and a layout. The engine is a pointer to the starting location of the tensor, and the layout is further broken down into two parts: shape and stride. So if a tensor is described in CuTe's language, we know where it's located, what shape the data is, and how it's scattered across the memory. And we can perform (in some sense) arithmetic operations between the layouts, which is called **layout algebra** in CuTe terms.
+
+If you're interested in it (and wanna go through the similar rabbit hole as I did), please consult to [NVIDIA's documentation](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/02_layout_algebra.html).
+
+Anyway, I found CuTe is interesting enough to dig into (and it's also used in 4th paper of flashattention!), so I followed through official docs and tutorial MMA code to understand it and get familiar with it.
+
+Along the way, I became more and more curious about the (seemingly) random design choices behind the kernels. So I tried to mimic them, see what happens if I tweak certain parts, and eventually got stuck on the question: "what should I do to make my kernel faster?"
+
+[This blog post](https://alexarmbr.github.io/2024/08/10/How-To-Write-A-Fast-Matrix-Multiplication-From-Scratch-With-Tensor-Cores.html) helped me a lot, and I actually decided to do the same thing the author did: write and improve an MMA kernel up to cuBLAS-level performance on a T4 GPU, but using CuTe.
+
+<br>
+
+## Why T4? / T4 limitations
+The reason behind choosing T4 was simple: it is affordable. You can rent a T4 on EC2 for a fairly cheap rate (my case $0.8/hour). Plus, google colab gives you free access to it (like, really for free) so you can iterate on your kernel implementation, see if there's errors, and check correctness before running your benchmark code on ec2 instance.
+
+Besides all these good things about T4, the card also comes with several limitations. It's built on the sm_75 (Turing) architecture, which means:
+- you don't have cp.async (introduced in Ampere architecture), so you always have to keep register buffer for loading data from gmem -> smem. This is bad because it has real effect on register pressure.
+- Actually I think this is it, I mean you can have some cool features like TMA or warp specialization on newer architectures like Hopper, but T4 is good enough for learning purpose.
+
+<br>
+
+# Performance
+First things first, I'll share my kernel's benchmark result and compare with cuBLAS!
+
+| Kernel | Optimization | GFLOPS/sec | vs Previous | vs cuBLAS |
+|--------|-------------|------------|-------------|-----------|
+| 1 | Naive | 3,000.78 | — | 6.3% |
+| 2 | Tiled copy + tiled MMA (vectorized) | 12,423.8 | +314% | 26.0% |
+| 3 | Swizzle | 20,233.8 | +63% | 42.5% |
+| 4 | Explicit register buffer for copy | 21,553.1 | +6.5% | 45.2% |
+| 5 | Arithmetic intensity improvement | 37,117.8 | +72% | 77.9% |
+| 6 | LDSM pipelining + MMA tile size fix | 40,079.6 | +8.0% | 84.1% |
+| 7 | 2-stage pipelining | 42,957.1 | +7.2% | **90.1%** |
+| cuBLAS | Reference | 47,655.2 | — | 100% |
+
+Kernel 7 achieved **90.2% of cuBLAS performance**. From here on, I'll walk you through my kernel-writing journey, along with the knowledge I picked up to improve it step by step! the full source code can be found on [my github](https://github.com/chamgeon/mma_benchmark_T4/tree/main).
+
+<br><br><br><br>
+
+# Kernel 1
+In kernel 1, I deliberately wrote the implementation to be as naive as possible, with no CuTe features like tiledcopy or tiledmma, and even the choice of tile sizes and thread layouts were rather arbitrary. So this is basically equivalent to:
+
+```cpp
+for (int k = 0; k < size<1>(tCsA); ++k) {
+  for (int m = 0; m < size<0>(tCrC); ++m) {
+    for (int n = 0; n < size<1>(tCrC); ++n) {
+      tCrC(m,n) += tCsA(m,k) * tCsB(n,k);
+    }
+  }
+}
+```
+
+The result wasn't good at all: just **3 TFLOPS** on a GPU with a 65 TFLOPS peak. So let's start improving it!
+
+<br><br><br><br>
+
+# Kernel 2
+Now we're talking, here we introduced two new techniques: vectorized copy (g->s) and the utilization of tensor cores via `mma` instruction. Let's first talk about what these things are about.
+
+<br>
+
+## Vectorized copy
+Vectorized copy means moving multiple contiguous data in a single instruction, instead of moving one element at a time. This is faster because:
+
+**Fewer instructions**: Each instruction carries its own overhead, like fetching, decoding, issueing, etc. When the memory instruction pipeline is already saturated, which is typically the case for MMA kernels, reducing instruction count becomes critical.
+
+**Better memory transaction utilization.** The cache line size on a T4 GPU is 128 bytes, meaning every memory transaction moves at least 128 bytes regardless of how much of that data you actually need.
+
+To see why this matters, consider the un-vectorized case of loading fp16 data from global memory. Each thread issues an `LDG.E.U16` SASS instruction, loading only 16 bits at a time. With 32 threads in a warp, this loads 32 × 2 = 64 bytes total. But since the transaction still pulls a full 128-byte cache line, half of the data fetched goes unused.
+
+<br>
+
+## mma instruction
+Instead of computing `d = a*b + c` element-by-element on CUDA cores (general-purpose), we should be using tensor cores by issuing PTX instructions like `mma.m16n8k8`.
+
+To use `mma`, the input matrices (A, B) and accumulator (C) must be laid out across threads in a specific pattern expected by the instruction. The required layouts look like this ([source](https://docs.nvidia.com/cuda/archive/12.6.2/parallel-thread-execution/#matrix-fragments-for-mma-m16n8k8)):
+
+![ptx_A](/images/cute_mma/ptx_mma_layout_A.png)
+![ptx_B](/images/cute_mma/ptx_mma_layout_B.png)
+![ptx_C](/images/cute_mma/ptx_mma_layout_C.png)
+
+Once each thread grabs correct fragment of A, B and C matirces in the register, we call `mma` and calculate much faster on the tensor core, fast is good good.
+
+<br>
+
+## CuTe Atoms
+Actually, we can implement this kind of things kinda easily in CuTe. Instead of manually working out offsets like we do in raw CUDA, we can stay within higher level thanks to a special structs called **Atoms**.
+
+As you can infer from the name of it, Atoms are the minimal unit of computation in CuTe. It can be broken down into two parts: Operation and Traits.
+
+**Operation** exposes raw PTX instruction to use in the Atom. It could be: `cp.async` or `ldmatrix` for Copy_Atom, or `mma` instruction for MMA_Atom. It has minimal software dependencies, and just expects the arguments to pass (like registers) to build the final PTX instruction.
+
+**Traits** specifies meta-information about the operation, such as compute type, problem shape, and the layouts of thread and values within the operation. 
+
+Together, they comprise an Atom. Atom can operate at a variety of levels, including:
+- a single thread (e.g. global copy)
+- a warp (e.g. ldsm, mma)
+- and more (e.g. warpgroup in Hopper)
+
+<br>
+
+## Program design
+
+Since CuTe already handles Atom-level computation, we can start build the program from there. Going up from the Atom level, there is the thread block (CTA) level. In this level, we consider how the threads (or warps) in a program work together to complete requested jobs. Going up one step more, we have tiles. Tiles directly split the full workload, so we can say that tiles are the largest unit of iteration in a program.
+
+Having this hierarchy (atom -> cta -> tile -> program) in my mind, I would like to describe my design choices in a visual way. In the plots below, I will place 1) atom view 2) tile view and 3) cta view side-by-side, so that the three levels could be understood in the relationships with each other.
+
+First, here's the visual representation of the global copy:
+
+![kernel2_visual_gscopy](/images/cute_mma/kernel_2_copy.png)
+
+The copy atom used here is `UniversalCopy<uint128_t>`. It fits 128 bits into a single copy instruction, moving 8xfp16 elements at once. The thread layout is 16x8 (row-major), so a thread block (CTA) moves 16x64 at once. The atom is operating on a thread level here (1 thread in an atom).
+
+Now, let's move on to the design of mma. Here's the visual representation of how warps split the tiles used for mma workload:
+
+Tile A(128x64):
+![kernel2_visual_mmaA](/images/cute_mma/kernel_2_mma_A.png)
+
+Tile B(128x64)
+![kernel2_visual_mmaB](/images/cute_mma/kernel_2_mma_B.png)
+
+Accumulator C(128x128):
+![kernel2_visual_mmaC](/images/cute_mma/kernel_2_mma_C.png)
+
+The mma atom used here is `SM75_16x8x8_F32F16F16F32_TN`. It grabs a 16x8 subtile of A tile, 8x8 subtile of B tile, calculate matrix multiply, and accumulate it on 16x8 sub matrix of accumulator C with fp32 precision. 'TN' at the last describes the majorness of A tile and B tile, and here we assumes transposed A matix and non-transposed B matrix, both K-major (i.e. K dimension is faster than M,N dimension).
+
+Since the `mma.sync` ptx instruction works on the warp-level, this atom also works on the same level. We can see the 32 threads within a warp are layed out as the pattern requred for mma instruction, each thread grabbing 4 elements for tile A and accumulator C (16x8), and 2 elements for tile B (8x8).
+
+It is worth note that the atoms at the position (0,0) and (0,1) shares the same 0th subtile of A, and the atoms at the position (0,0) and (1,0) shares the same 0th subtile of B. Therefore, each warp get to grab (warp%2)th A-subtile and (warp//2)th B-subtile.
+
+With the massive help of CuTe framework and hierarchical analysis of workload, I was able to successfully integrate **vectorized copy** and **usage of mma instruction** to the kernel. As a result, our second kernel scored **12.4 TFLOPS**, improving +314% compared to the previous naive kernel!
+
+<br><br><br><br>
+
+# Kernel 3
+In kerenel 3, I introduced a well-known optimization strategy called shared memory swizzle. To understand this technique, first we need to understand the basic characteristic of shared memory.
+
+<br>
+
+## Shared memory architecture
+Shared memory has a concept of 'banks'. It's like columns of memory, where you cannot touch the same bank simultaneously in a single transaction (if you do, smem will break it down into multiple transaction, which is slow obviously). Here's the visual representation of shared memory bank:
+
+| Bank 0 | Bank 1 | Bank 2 | Bank 3 | ... | Bank 29 | Bank 30 | Bank 31 |
+|---|---|---|---|---|---|---|---|
+| 4 bytes | 4 bytes | 4 bytes | 4 bytes | ... | 4 bytes | 4 bytes | 4 bytes |
+| 4 bytes | 4 bytes | 4 bytes | 4 bytes | ... | 4 bytes | 4 bytes | 4 bytes |
+| ... | ... | ... | ... | ... | ... | ... | ... |
+
+Each bank spans 4 bytes, so if we access the shared memory with stride of 128 bytes (e.g. 64 stride for fp16 values), it will cause bank conflict and there will be redundant memory transactions which could be avoided with different memory access pattern.
+
+<br>
+
+## Swizzle
+To save us from this inefficiency, we have a beautiful solution called swizzle. It uses XOR operation to generate permutated pattern of memory access. 
+
+For example, let's say we are trying to load an 8x8 matrix from shared memory, each row strided by 128 byte. Then we have this pattern of memory access:
+
+![before_swizzle](/images/cute_mma/before_swizzle.png)
+
+If we load this 8x8 matrix, that instruction will be broken down into 8 separate memory transaction (8-way bank conflict), because every row is trying to hit the same memory banks.
+
+However, what if we kinda 'permute' the actual location of the data for its rows to be spread across the banks? Like this:
+
+![after_swizzle](/images/cute_mma/after_swizzle.png)
+
+This idea is swizzle, and we can achieve this by applying XOR calculation between the bits that comprises 'row' and 'column' of the offset. For example, lets say a 'column' is made of 4 memory banks, accommodating for 8 elements of fp16 values. Then there will be 8 columns to permute since there are 32 memory banks in smem. 
+
+How do we switch the order of the columns? we XOR column bits with row bits. XOR is bijection, so if we do col_bits XOR row_bits, it will always produce different value for different rows. Let's say our column is 0 (000 in bits), and we have 0~7 rows (000~111 in bits). 
+
+000 XOR 000 -> 000 (col 0)<br>
+000 XOR 001 -> 001 (col 1)<br>
+000 XOR 010 -> 010 (col 2)<br>
+000 XOR 011 -> 011 (col 3)<br>
+000 XOR 100 -> 100 (col 4)<br>
+000 XOR 101 -> 101 (col 5)<br>
+000 XOR 110 -> 110 (col 6)<br>
+000 XOR 111 -> 111 (col 7)<br>
+
+So if we have 8x8 matrix with same column number 0 shared across its rows, we apply swizzle, then the rows will be spread acorss column 0~7, causing no bank conflict. If you would like to have more explanation about swizzle which I did poorly here, you will absolutely like to check out [here](https://leimao.github.io/blog/CuTe-Swizzle/).
+
+Actually, considering our current A/B tile sizes of 128x64 (row major, fp16), accessing 8x8 matrix will cause a full 8-way bank conflict, because every row in the 8x8 matrix maps to the exact same banks as every other row.
+
+<br>
+
+## Cute Implementation
+CuTe has already implemented this, so we can just use it. All we have to do is choosing correct swizzle parameters. To explain it briefly:
+
+- **MBase** means how many elements do you want to keep intact (not affected by XOR)
+- **BBits** is the number of bits in the mask
+- **SShift** is the distance to shift the mask 
+
+Our most complex access pattern to shared memory is 8x8 matrix (`ldmatrix` does it), then we want to:
+
+- keep 8 elements (a single row) intact (MBase = 3)
+- 8 elemnts use 4 banks, so we have 8 (32/4) columns to permute (BBits = 3)
+- we want to do XOR with row bits, which starts right after column bits ends (SShift = BBits = 3)
+
+So the correct swzzle for us is **Swizzle<3,3,3>**.
+
+It was really helpful to improve the pattern of memory access to our super-busy shared memory, kernel 3 improved +63%, scoring **20 TFLOPS**.
+
+<br><br><br><br>
+
+# Kernel 4
+I would like to call kernel 4 as 'weak pipelining attempt'. I thought I was doing something meaningful, but pretty much of the job was already done by something called **ILP**(instruction-level parallelism).
+
+<br>
+
+## What I tried to do
+In kernel 4, I was trying to hide the latency of gmem copy with other independent calculation, such as `ldsm` (shared -> register copy) or `gemm`. To achieve this, I had to do two things:
+
+First, make global load more explicit. In the previous kernels, I was doing something like `copy(copy_gs, thr_gs_gA(_,_,_,i), thr_gs_sA);`. It looks like copying global -> shared directly, but under the hood it's actually two parts (T4 thing): load from global memory into registers, then store from those registers into shared memory. I made these two steps explicit by separating the global -> register load and the register -> shared store into distinct operations.
+
+Second, I made the global -> register load for the **next** tile is issued ahead of current tile's computation, so it's in-flight while the shared -> register load and gemm execute. So it's basically like this:
+
+![kernel_4_flow](/images/cute_mma/kernel_4_flow.png)
+
+here, the s -> r load and gemm is not dependent on current iteration's global load, so they can be done in parallel.
+
+I thought I was doing a good job, successfully hiding latency of global load with computations like gemm. However, the performance went up by rather marginally, so I was like why?
+
+<br>
+
+## What was already being done
+While looking at the implementation of previous kernels, I realized I was wrong to think the previous kernel as fully sequential like: global load -> shared load -> gemm -> global load -> ...
+
+Actually, if you look at the main loop of kernel 3:
+
+```cpp
+CUTE_UNROLL
+for(int i=0; i<k_tile_num; ++i){
+    copy(copy_gs, thr_gs_gA(_,_,_,i), thr_gs_sA);
+    copy(copy_gs, thr_gs_gB(_,_,_,i), thr_gs_sB);
+    __syncthreads();
+
+    copy(copy_sr_A, thr_sr_sA, thr_sr_rA);
+    copy(copy_sr_B, thr_sr_sB, thr_sr_rB);
+    __syncthreads();
+
+    gemm(mma, thr_mma_rA, thr_mma_rB, thr_mma_rC);
+}
+```
+
+The loop body looks fully sequential, but it's worth considering the boundary between iterations. At the boundary of loops, we have:
+
+- gemm of earlier iteration
+- global load of next iteration
+
+They don't depend on each other (gemm consumes mma register, while global load fills up copy register), and there's no __syncthreads() in between.
+
+![kernel_3_flow](/images/cute_mma/kernel_3_flow.png)
+
+As a result, gemm and global load can be overlapped, and this optimization was already done by smart compiler/hardware early on kernel 3. Therefore, the performance gain in kernel 4 was marginal, scoring **21TFLOPS** (+6.5%). I think this minimal gain came from the small overlap of global load and shared load, because they are the only additional independant parts introduced in kernel 4.
+
+<br><br><br><br>
+
+# Kernel 5
+In compute-intensive programs like our 8192×8192×8192 MMA kernel, raw compute power isn't always the bottleneck, because data movement can be just as limiting. If data isn't delivered fast enough, compute units sit idle and peak performance goes unrealized. Assuming our kernel is otherwise well-written, performance is ultimately constrained by two ceilings:
+
+- Memory throughput - how fast data can be fed to the compute units
+- Compute throughput - the theoretical peak performance of the hardware
+
+so at this point, I was wondering If our kernel's performance was being held back by these limits, especially by memory ceiling (hitting compute ceiling means achieving peak performance). There's a good model to analyze this situation, the **Roofline Model**.
+
+<br>
+
+## Roofline model
+Here, we break down performance (FLOP/s) into two parts:
+
+- **Memory throughput** is the rate at which data can be moved between memory and compute units, measured in (byte/s). 
+- **Arithmetic intensity** is the ratio of floating-point operations to bytes of memory traffic (FLOP/byte).
+
+Put simply, the more computation you squeeze out of each byte fetched from memory, the more efficiently you're utilizing memory bandwidth. And once you're in the region where you can feed compute unit without them starving, you're compute bounded. The roofline chart determines which ceiling does a kernel belong to, based on the arithmetic intensity on the x-axis and performance on y-axis. 
+
+Let's say our memory throughput is 320GB/s, and the peak compute is 65 TFLOPS (T4 numbers). Then the Roofline chart would be:
+
+![roofline](/images/cute_mma/T4_roofline.png)
+
+Here, the arithmetic intensity of the point where compute ceiling takes over is 203. So if we do 203 or more calculation per byte, we're no longer bounded by memory throughput. But, how do we know the arithmetic intensity of our computation then? 
+
+<br>
+
+## A.I. of MMA
+To figure out it, we need to first understand our workload. The Matrix Multiply-Accumulate computation looks like this:
+
+![flops_mma](/images/cute_mma/MMA_flops.png)
+
+For each output element, we perform 2K operations (K multiplications and K additions), giving a total operation count of 2MNK.
+
+To make this possible, we load matrix A (M×K) and matrix B (K×N), both in fp16 precision (2 bytes per element). The total memory traffic is therefore 2(MK + KN) bytes. Putting it together:
+
+**Arithmetic Intensity** = computation / memory traffic = 2MNK / 2(MK + KN) = **MN / (M+N)**.
+
+<br>
+
+## How to increase Arithmetic Intensity
+Since the arithmetic intensity of our MMA kernel depends on M and N, it might seem straightforward to just increase the A and B tile sizes to push AI higher. However, there are two hard constraints that limit how large these blocks can be:
+
+- **Shared memory capacity**: There are fixed shared memory budget. Larger tiles of A and B consume more of it, but we just cannot exceed the limit. (In case of T4, it's 64KB for dynamic smem)
+- **Register pressure**: The accumulator, with MxN fp32 values, takes up a large part of the register already. If we increase tile size beyond the register can comfortably accomodate, it will spill to the global memory, and we say bye-bye to the performance.
+
+Other than the size of A and B matrices, there's another factor at play: **data reuse through the L2 cache**.
+When a tile of A or B is loaded from global memory, it doesn't necessarily get discarded after one use. If it remains in L2, subsequent thread blocks can read it from cache rather than fetching it from gmem again. This effectively reduces the true memory traffic seen at the global memory level, pushing the arithmetic intensity higher than our theoretical estimate of MN/(M+N) suggests.
+
+In summary, to Increase Arithmetic Intensity, we have two strategies:
+- **Increase tile size**, up to the point it doesn't go beyond smem budget or make register spill
+- **Increase L2 cache hit**, this is a free A.I. boost, the more the better.
+
+<br>
+
+## Is the kernel memory bound?
+By the way, is our kernel 4 actually memory bound or not? Given that the L2 cache hit rate has a meaningful impact on effective arithmetic intensity, we cannot just rely on theoretical calculation. To save our ass, `ncu` (the kernel profiling tool of NVIDIA) provides the roofline analysis of our kernel! It shows us the actual runtime measurement, and of course the cache behavior is already factored in. Here's the tensor core roofline chart of kernel 4:
+
+![kernel_4_roofline](/images/cute_mma/kernel_4_roofline.png)
+
+From the roofline plot, we can see kernel 4's arithmetic intensity (~70 FLOP/byte) sits well below the ridge point (the third square, for DRAM traffic analysis), where the memory-bound and compute-bound regions meet. Therefore, the kernel 4 is clearly memory-bound. Moreover, the green dot (kernel's actual DRAM access) is already pushing against the memory bound roof, a strong sign that memory traffic is the primary bottleneck now.
+
+<br>
+
+## Increasing AI
+Now that we know how to increase arithmetic intensiry, let's actually improve our kernel. what I did was roughly two things:
+- Increase theoretical AI by increasing tile size
+- Increase effective AI by improving cache reuse
+
+### Increase tile size
+Kernel 4 uses a 128x64 size for both A and B tiles. Given that the theoretical arithmetic intensity for an MMA kernel is MN/(M+N), we have: 128x128/(128+128) = 64 FLOP/byte. To get close to the ridge point, let's try increasing the tile size!
+
+Here, we're faced with two options:
+
+- **Option 1: M = N = 256**, theoretical AI of 256x256/(256+256) = 128 FLOP/byte
+- **Option 2: M = 256, N = 128 (or vice versa)**, theoretical AI of 256x128/(256+128) = 87.33 FLOP/byte
+
+Option 1 looks attractive on paper, but register pressure rules it out. The accumulator alone would require 256×256 fp32 values - 65,536 registers - which exactly fills the per-SM register limit on Turing. This leaves no headroom for the rest of the program without spilling to global memory. Therefore, Option 2 is the only viable path, at 32,768 registers for the accumulator.
+
+Increasing the tile size also introduces a second constraint: **shared memory occupancy**. The T4 has 64KB of dynamic shared memory per SM, and kernel 4 fits two concurrent thread blocks per SM, since each requires 2×128×64×2 bytes = 32KB. 
+
+With the larger block size, that per-block requirement rises to 48KB, making it impossible to run two blocks on the same SM simultaneously. To compensate for the resulting drop in occupancy, I doubled the number of warps per block from 4 (128 threads) to 8 (256 threads), a change that also required reworking the thread and warp layout within the thread block.
+
+### Improving cache reuse
+To analyze cache reuse, we need to first consider the memory access footprint of each thread block. Here's the visual representation of a program's memory access footprint:
+
+![mem_footprint](/images/cute_mma/mem_footprint.png)
+
+Each thread block with index (x, y) is responsible for computing the (x, y)-th MxN tile of the output matrix. To do so, it sweeps across the K dimension, loading a row strip of width K from matrix A and a column strip of height K from matrix B. Therefore, the memory footprint for one thread block is (M+N)x8192xfp16 = (128+256)x8192x2 = 6MB.
+
+With only 4MB of L2 cache on the T4, a single thread block's memory footprint already exceeds what the cache can hold. Since each SM runs one thread block at a time and the T4 has 40 SMs, the total working set across the GPU is roughly 6MB × 40 = 240MB. In implementation with no consideration of cache reuse, this large traffic will go directly into global memory, causing terrible memory access bottleneck.
+
+Then, how to increase cache reuse? To our disappointment, according to CUDA programming guidebook (2.3.7):
+
+>The details of which thread blocks are scheduled to execute on which SMs cannot be controlled or queried by the application and no ordering guarantees are made by the scheduler, so programs cannot rely on a specific scheduling order or scheme for correct execution.
+
+There is no formal guarantee on the order in which thread blocks are scheduled. However, [empirical evidence](https://stackoverflow.com/questions/46660053/is-blockidx-correlated-to-the-order-of-block-execution) suggests that blocks tend to execute in flattened index order, roughly: (0,0) -> (0,1) -> (0,2) -> ... -> (1,0) -> ...
+
+Assuming that execution order, we can imagine 1 or 2 row strips of Mx8192 size being used repeatedly, and ideally we want to keep it in L2 cache. So which block size should M be, 128 or 256?
+
+- M=128, 1 row strip of matrix A would be: 128x8192xfp16 = 2MB
+- M=256, 1 row strip of matrix A would be: 256x8192xfp16 = 4MB
+
+Given the T4's 4MB L2 cache size, we should go for M=128 option. It comfortabily fits 1 row strip of matrix A within cache, and it is less likely to be evicted because of 2MB of headroom for transcient (Matrix B, accumulator write) caches. Thus, our solution for block size is: **128x64 for A tile, 256x64 for B tile**.
+
+### the result
+The implementation itself was quite simple. All I did was just adjusting the tile size and updating the thread/warp layout accordingly. The result, however, was significant:
+
+![kernel5_roofline](/images/cute_mma/kernel5_roofline.png)
+
+The effective arithmetic intensity with respect to DRAM more than doubled, from 70 to 144 FLOP/byte. While the kernel remains in the memory-bound regime, the performance improvement was substantial +72%, reaching **37 TFLOPS**.
+
+<br><br><br><br>
+
+# Kernel 6
+In kernel 6, I was still trying out the idea of pipelining, and the target was to hide the latency of `ldsm` call. Similar to the case of kernel 4, most of the job was already being done by the smart work of compiler and hardware, which can re-order unrelated instructions and run them in parallel.
+
+However, implementing this had a significant side-effect, which was effectively separating STS (store to shared memory) and LDG (load from global memory), resulting in fewer short scoreboard stall (warp waiting for shared memory instruction to be finished).
+
+Additionally, I noticed some inefficiency in the warp layout, which was incurring redundant number of `idsm` calls. Handling this, the number of `ldsm` calls are reduced by 20%.
+
+<br>
+
+## LDSM pipelining
+My idea of 'ldsm pipelining' was something like this:
+
+![ldsm_pipeline](/images/cute_mma/ldsm_pipeline.png)
+
+By making `ldsm` one step ahead of gemm, the ldsm-gemm pair of one mini step (e.g. ldsm 1 and gemm 0) can be independent on each other and run simultaneously. The changes I made to implement this include:
+
+- make inner loop explicit, adding k_block loop (k width 8) inside the k_tile loop (k width 64).
+- make ldsm transfer the next k_block, making it independent of gemm calculation of current k_block.
+- applied loop unrolling only to the inner loop, making outer loop kept rolled.
+
+now the main loop code looks like this:
+
+```cpp
+//main loop
+auto K_TILE_MAX = size<3>(thr_gs_gA);
+auto K_BLOCK_MAX = size<2>(thr_mma_rA);
+
+CUTE_NO_UNROLL
+for(int k_tile_cur=0; k_tile_cur<K_TILE_MAX; ++k_tile_cur){
+    CUTE_UNROLL
+    for(int k_block_cur=0; k_block_cur < K_BLOCK_MAX; ++k_block_cur){
+        if(k_block_cur == K_BLOCK_MAX-1){
+            __syncthreads();
+            copy(thr_gs_rA, thr_gs_sA);
+            copy(thr_gs_rB, thr_gs_sB);
+            __syncthreads();
+        }
+        
+        auto k_block_next = (k_block_cur+Int<1>{})%K_BLOCK_MAX;
+        copy(copy_sr_A, thr_sr_sA(_,_,k_block_next), thr_sr_rA(_,_,k_block_next));
+        copy(copy_sr_B, thr_sr_sB(_,_,k_block_next), thr_sr_rB(_,_,k_block_next));
+
+        if(k_block_cur == 0){
+            int k_tile_next = (k_tile_cur + 1 < K_TILE_MAX) ? k_tile_cur + 1 : k_tile_cur;
+            copy(copy_gs, thr_gs_gA(_,_,_,k_tile_next), thr_gs_rA);
+            copy(copy_gs, thr_gs_gB(_,_,_,k_tile_next), thr_gs_rB);
+        }
+
+        gemm(mma, thr_mma_rA(_,_,k_block_cur), thr_mma_rB(_,_,k_block_cur), thr_mma_rC);
+    }
+}
+```
+
+In hindsight, this kind of job was already being done. Since the instruction of an ldsm is independent to all other instructions except for the gemm within the same k_block, the compiler and hardware were already taking advantage of this opportunity.
+
+However, there was a nice side effect to this change, and it unintendedly streamlined the execution order. In kernel 5, we have to do `LDG` (global load) right after `STS` (store to smem) at the boundary of the loop. Since they share the same copy register, `LDG`s have to wait the full cycle of shared memory store, and this situation was causing severe short scoreboard stall.
+
+In contrast, In kernel 6, we inserted the last iteration of inner loop between `STS` and `LDG`, and there is plenty of time to wait for `STS` calls to finish before doing `LDG` on the same register. 
+
+Actually, We cannot say the dependence was eliminated; instead, it has shifted. The immediate dependence for the `STS` instruction is now on the `ldsm` right after, because it consumes the first k_block of the new k_tile stored by the `STS`.
+
+![ker56_loopbound](/images/cute_mma/kernel_5_6_loopboundary.png)
+
+However, comparing the SASS emitted from kernel 5 and kernel 6, it seems there is more flexibility to fit in more `gemm`s between them:
+
+kernel 5:
+![ker5_loopbound](/images/cute_mma/kernel_5_loopboundary.png)
+
+kernel 6:
+![ker6_loopbound](/images/cute_mma/kernel_6_loopboundary.png)
+
+In kernel 5, we can see the LDGs are dependent on the STS only about 4 instructions ahead. On the other hand, in kernel 6, the first ldsm instruction after STS is issued about 15 instructions behind. As a result, there is enough time to hide the latency of STS, leading to much less short scoreboard stall.
+
+<br>
+
+## Warp layout inefficiency
+In the kernel 5, we've changed the tile sizes (M=N=128 to M=128, N=256) and the warp size (4 to 8). Considering this, I was wondering if I was designing the program correctly. Specifically, the suspicious part was the new warp layout of mma:
+
+```cpp
+//kernel 5 warp layout: 4x2x1 atoms per cta
+auto const mma_warps_shape = make_shape(Int<4>{}, Int<2>{}, Int<1>{});
+```
+
+With the 4x2x1 warp layout combined with 16x8x8 mma atom, our mini-tile design in kernel 5 is: 64x8 mini-tiles for tile A, and 16x8 mini-tiles for tile B. Considering the fact that B tiles are 2x larger than A tiles (M=128 vs N=256), the program design felt hugely imbalanced.
+
+Indeed, while the number of `gemm` stays constant, the number of `ldsm`s can be affected by this imbalance of workload. Here's visual representation of A and B tile data grabbed by warp 0 in 4x2x1 warp layout:
+
+![warp_421](/images/cute_mma/warp_421.png)
+
+Here, a warp grabs 2^11 elements per A tile and 2^13 elements per B tile, in total 5x2^11 elements. However, if we change the warp layout to 2x4x1:
+
+![warp_241](/images/cute_mma/warp_241.png)
+
+a warp grabs the same 2^12 elements per A and B tile, in total 4x2^11 elements. Therefore, the number of `ldsm`s, as well as the size of register holding A and B tiles, can be reduced by 20 percent!
+
+By leveraging the corrected warp layout alongside with the streamlining effect of ldsm pipelining, kernel 6 achieves **40 TFLOPS**, up by 8% compared to kernel 5.
+
+<br><br><br><br>
+
+# Kernel 7
+In kernel 7, I again tried to push the pipelining further, caught up in the assumption that "pipelining will make the kernel faster in somehow way." By now you can probably see the pattern: I keep applying pipelining techniques that don't actually hide latency the way I expected, yet somehow still streamline the program.
+
+<br>
+
+## Double buffering
+Here, I tried the technique of double buffering. The idea is fairly simple:
+
+![double_buffer](/images/cute_mma/double_buffering.png)
+
+- At step 1, The global load starts filling buffer 2, while `ldsm` and gemm consume the data already prefilled in buffer 1.
+- At step 2, The global load starts filling buffer 1, while others consume the data in the buffer 2.
+- Repeat these 2 steps.
+
+By alternating which buffer is being filled and which is being consumed, the instructions that are producing and consuming the data never touch the same buffer at the same time.
+
+<br>
+
+## The changes in kernel 7
+
+To implement this double buffering, I first had to **decrease the tile sizes**. Our 128×64 and 256×64 fp16 tiles already occupy 48KB of shared memory, and doubling that would exceed the 64KB shared memory budget. The tile sizes need to be decreased, but how do we shrink the tiles without hurting arithmetic intensity?
+
+Remember the arithmetic intensity formula, MN/(M+N)? it doesn't depend on K at all! This means we can shrink the K dimension of the tile freely without any impact on arithmetic intensity. So I decided to halve the K size of the tiles, and then double the number of tiles.
+
+Now that we have a smaller K dimension, the **cache behavior changes** as well. Specifically, we assume the A and B matrices in global memory are K-major, meaning elements are contiguous along the K dimension. Since the cache line size is 128 bytes, and 32 fp16 values along the K dimension only take up 64 bytes, each load now under-fills a cache line, leading to less efficient memory transactions.
+
+After observing the performance drop likely induced by this situation, I started to try out different cache operators and cache policies. After some experiment, it turns out that `ld.global.cg.L2::128B.v4.b32` is the best fit, although I couldn't fully explain why. Maybe bypassing L1 cache (.cg) and fixing L2 prefetch (L2::128B) made cache image more consistent?
+
+Anyway, the last change I made was the **introduction of a dynamic variable** named `pipe`. It dynamically selects the pipeline index within the loop, enabling alternation between buffers. 
+
+<br>
+
+## Dependence analysis
+But seriously, what latency are we hiding further beyond the previous level? Because, isn't the latency of global load already hidden by gemm computation, as of kernel 4 (or before it, implicitly by ILP)?
+
+![sts_analysis](/images/cute_mma/sts_analysis.png)
+
+Indeed, after analyzing the execution order, the only benefit I got by the introduction of double buffering was: more freedom of STS, which now doesn't touch the same shared memory region to the `ldsm`s before it. So it doesn't make any difference in terms of hiding the latency of global memory load. 
+
+With that in mind, I was wondering, what does it do then? Is the benefit of freely placing `STS` that significant? Kernel 7 was noticeably faster than kernel 6, but which factor drove that speedup? To answer to these questions, I started inspecting the ncu reports for both kernels.
+
+<br>
+
+## NCU analysis
+Here's the 'warp state statistics' section of ncu report of kernel 6 and 7. It shows the statistics of the reasons why warps stalled, from most frequent to least.
+
+kernel 6:
+![stall_6](/images/cute_mma/stall_ker6.png)
+
+kernel 7:
+![stall_7](/images/cute_mma/stall_ker7.png)
+
+Looking at the statistics, the most visible changes kernel 7 has made were: a dramatic decrease in MIO throttle stalls, along with an increase in long and short scoreboard stalls. What are these?
+
+- **MIO throttle** occurs when a warp stalls because the MIO (Memory Input/Output) instruction queue is full. All the memory instructions go through the MIO pipeline, so basically: Too much `LDG`s, `LDSM`s and `STS`es are issued at the same time, clogging the memory queue.
+- **Long scoreboard stall** occurs when a warp stalls waiting on a scoreboard dependency for a global memory access. If it appears, the latency of LDG is not hidden very well.
+- **Short scoreboard stall** occurs when a warp stalls waiting on a scoreboard dependency for a shared memory access. 
+
+So it seems like: We issued too much memory instructions at the same time in kernel 6, that it clogged the memory queue. Meanwhile in kernel 7, we don't have that problem, but instead we exposed more global and shared memory latency. How to explain this situation?
+
+<br>
+
+## My interpretation
+To be honest, I'm not fully confident about the interpretation here. The explanations here are more like pure speculations, but anyway I'll try my best to analyze the reasons behind the performance boost in kernel 7. 
+
+First, **the memory workload has been splitted**. Since the tile sizes has been halved, the memory workload per loop iteration was also splitted into halves. Given that the compiler tends to cluster load operations at the beginning of the loop, splitting one large memory workload into two smaller ones could have a significant effect on the MIO:
+
+![loop_cycles](/images/cute_mma/loopcycles.png)
+
+After transformation, the MIO queue could get more distributed workload rather than a flood of instructions. I think this led the significant decrease in MIO throttle stalls in kernel 7.
+
+Second, **gemms has been splitted, too**.
+
+![runway](/images/cute_mma/runway.png)
+
+The gemms, the main computation portion of the kernel, serve as the primary component that hides memory latency. Since the gemms are also splitted into halves, we have smaller number of calculations in between memory operations, thus have larger long / short scoreboard stalls. 
+
+Then, we have **the tradeoff**. We traded a reduction in MIO throttling for an increase in scoreboard stalls. Is it good deal or not? All that I can say is, MIO stalls seem to be worse enemy than scoreboard stalls.
+
+The MIO queue is a resource shared across all warps on an SM, and if it backs up, every warps attempting a memory operation stalls. Scoreboard stalls, on the other hand, are local to a single warp. Moreover, they suggest that memory instructions are already in flight, rather than stuck waiting to even be issued.
+
+Therefore, I would like to say that: kernel 7 made a good trade between mio throttle stalls and scoreboard stalls via splitting the workload into halves. As a result, we got faster kernel.
+
+### Alternative interpret
+This was my best version of explanation, but several other explanations are possible. Like: 
+
+**The MIO stalls were actually hiding the scoreboard stalls** in kernel 6, and that is just exposed in kernel 7. Considering the fact that we are still memory-bound (the arithmetic intensity is about 140, but the ridge point is around 170), it is absolutely possible that there were underlying memory latency problem even though kernel 6 shows scoreboard stalls almost close to 0.
+
+Or, now that dynamic address calculation has been introduced via the `pipe` variable, **the extra integer arithmetic could be keeping warps busy computing** rather than waiting on the MIO queue. This seems entirely plausible too, because kernel 7 has about 15% more instructions than kernel 6. This extra arithmetic could also be exposing the scoreboard stalls more directly, since one of the largest short scoreboard stall contributors actually occurs during address calculation.
+
+<br>
+
+## Result
+Anyway, the result of kernel 7 was solid: **42.9 TFLOPS**, achieving 90.1% of the cuBLAS performance! I think it's a pretty good score, isn't it? I know it is way harder to climb up that last 10 percent than the 90% I covered, but it makes me kinda happy that my kernel's performance is 90% close to the performance of NVIDIA's kernel!
+
+<br><br><br><br>
+
+# Conclusion
+I'll stop my journey here, because I think I've gotten a pretty solid answer to the question that started all this: "what is this CuTe thing even about?" It took several months of deep, focused learning to get here: working through CuTe primitives like `partition_S` and `zipped_divide`, understanding GPU architecture and the memory hierarchy, figuring out what "performance" actually means in this context, and learning how to read an ncu profile well enough to trust what it was telling me.
+
+What made this rabbit hole so satisfying, I think, is that it has one absolute, unambiguous value to optimize for: **performance**. Every change I made got evaluated immediately and honestly, because the GPU only care about the real program, not my theories. And `ncu` gave me the best possible vision into the machine, letting me actually see where my assumptions were wrong. That combination, a clear objective and a tool sharp enough to explain it, is what kept me coming back to this even when progress was slow. I'm happy with where I landed, and with everything I had to learn just to get here.
+
+By the way, I know there are more ways the kernel could be optimized further: 
+
+- First, I didn't work on the epilogue, which writes back the computed final values. I simply relied on `axpby` function, and there absolutely were rooms to optimize, such as coalescing scattered values into vectorized writeback tensors. I just think this job is overly complicated on T4, with relatively small expected gains. (I actually tried it but performance even dropped.)
+- Second, the arithmetic intensity of cuBLAS kernel is 210, which comfortably sits on the compute-bound region (the ridge point is 170). Meanwhile, my best arithmetic intensity was 149 (kernel 7). I think cuBLAS kernel has found a better way to utilize the L2 cache.
+- And others things like optimizing integer instructions, etc.
+
+But I think this is enough for now. Thank you for reading this!
+
+<br><br><br><br>
+
+# Reference
+[**Inspired post**](https://alexarmbr.github.io/2024/08/10/How-To-Write-A-Fast-Matrix-Multiplication-From-Scratch-With-Tensor-Cores.html): This post got me into this task, great work and thank you for inspiring me!
+
+[**NVIDIA CuTe**](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/02_layout_algebra.html): My starting point to learn CuTe. 
+
+[**Swizzle post**](https://leimao.github.io/blog/CuTe-Swizzle/): This post got me really understand what swizzle is, and actually other articles from this author is super good and helpful. MAD respect
+
+[**Roofline paper**](https://people.eecs.berkeley.edu/~kubitron/cs252/handouts/papers/RooflineVyNoYellow.pdf): Sometimes the original paper teaches you best. 
+
+[**Excalidraw**](https://excalidraw.com): Every plots that I draw here is through the tool called excalidraw. Neat design and super easy use.
+
+And shout out to countless internet resources, random stackoverflow and NVIDIA forum questions, also my AI friends ChatGPT and Claude!
